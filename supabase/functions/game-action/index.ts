@@ -15,6 +15,37 @@ const supabase = createClient(
 
 const FREE = 0; // sentinel for the free center
 
+function mulberry32(seed: number) {
+  let a = seed >>> 0;
+  return function rng() {
+    a += 0x6d2b79f5;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function seededShuffle(values: number[], seed: number): number[] {
+  const rng = mulberry32(seed);
+  const arr = [...values];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function normalizeCartelas(raw: unknown): number[] {
+  if (!Array.isArray(raw)) return [1];
+  const selected = raw
+    .map((v) => Number(v))
+    .filter((n) => Number.isFinite(n))
+    .map((n) => Math.trunc(n))
+    .filter((n) => n >= 1 && n <= 200);
+  const unique = [...new Set(selected)].slice(0, 3);
+  return unique.length ? unique : [1];
+}
+
 function shuffled1to75(): number[] {
   const arr = Array.from({ length: 75 }, (_, i) => i + 1);
   for (let i = arr.length - 1; i > 0; i--) {
@@ -54,12 +85,61 @@ function generateCard(): number[] {
   return flat;
 }
 
+function generateCardFromCartela(cartelaNumber: number): number[] {
+  const normalized = Math.max(1, Math.min(200, Math.trunc(cartelaNumber) || 1));
+  const ranges: Array<[number, number]> = [
+    [1, 15],
+    [16, 30],
+    [31, 45],
+    [46, 60],
+    [61, 75],
+  ];
+
+  const cols = ranges.map(([lo, hi], colIndex) => {
+    const pool = Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+    return seededShuffle(pool, normalized * 100 + colIndex + 1).slice(0, 5);
+  });
+
+  const flat: number[] = new Array(25).fill(0);
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col < 5; col++) {
+      flat[row * 5 + col] = cols[col][row];
+    }
+  }
+  flat[12] = FREE;
+  return flat;
+}
+
+function combineCards(cartelas: number[]): number[] {
+  return cartelas.flatMap((cartela) => generateCardFromCartela(cartela));
+}
+
+function splitCards(combined: number[]): number[][] {
+  const cards: number[][] = [];
+  for (let i = 0; i < combined.length; i += 25) {
+    const chunk = combined.slice(i, i + 25);
+    if (chunk.length === 25) cards.push(chunk);
+  }
+  return cards;
+}
+
 function genRoomCode(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let s = "";
   for (let i = 0; i < 5; i++)
     s += chars[Math.floor(Math.random() * chars.length)];
   return s;
+}
+
+function genGameId(): string {
+  const now = new Date();
+  const stamp = `${now.getUTCFullYear()}${String(now.getUTCMonth() + 1).padStart(2, "0")}${String(
+    now.getUTCDate(),
+  ).padStart(2, "0")}-${String(now.getUTCHours()).padStart(2, "0")}${String(
+    now.getUTCMinutes(),
+  ).padStart(2, "0")}${String(now.getUTCSeconds()).padStart(2, "0")}`;
+  const suffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+  return `BB-${stamp}-${suffix}`;
 }
 
 // Single-line patterns: 5 rows + 5 cols + 2 diagonals
@@ -84,6 +164,17 @@ function detectWinningLine(card: number[], marked: number[]): { idx: number; nam
     const line = LINES[i];
     if (line.every((pos) => m.has(card[pos]))) {
       return { idx: i, name: LINE_NAMES[i] };
+    }
+  }
+  return null;
+}
+
+function hasAnyWinningLine(cards: number[], marked: number[]): { idx: number; name: string } | null {
+  const split = splitCards(cards);
+  for (let i = 0; i < split.length; i++) {
+    const win = detectWinningLine(split[i], marked);
+    if (win) {
+      return { idx: win.idx, name: `Card ${i + 1} · ${win.name}` };
     }
   }
   return null;
@@ -159,9 +250,11 @@ Deno.serve(async (req) => {
       }
 
       case "create_room": {
-        const { player_id, stake_amount } = args;
+        const { player_id, stake_amount, selected_cartelas, is_private } = args;
         if (!player_id) return json({ error: "missing player_id" }, 400);
-        const stake = Math.max(1, Math.min(500, Number(stake_amount) || 20));
+        const stakePerCard = Math.max(1, Math.min(500, Number(stake_amount) || 20));
+        const cartelas = normalizeCartelas(selected_cartelas);
+        const totalStake = stakePerCard * cartelas.length;
 
         // Check wallet
         const { data: p } = await supabase
@@ -170,7 +263,7 @@ Deno.serve(async (req) => {
           .eq("id", player_id)
           .maybeSingle();
         if (!p) return json({ error: "Player not found" }, 404);
-        if (p.wallet_balance < stake)
+        if (p.wallet_balance < totalStake)
           return json({ error: "Insufficient balance" }, 400);
 
         let code = "";
@@ -192,8 +285,10 @@ Deno.serve(async (req) => {
           .from("rooms")
           .insert({
             code,
+            game_id: genGameId(),
+            is_private: Boolean(is_private),
             host_id: player_id,
-            stake_amount: stake,
+            stake_amount: stakePerCard,
             lobby_seconds,
             lobby_ends_at,
             call_sequence: shuffled1to75(),
@@ -203,24 +298,33 @@ Deno.serve(async (req) => {
         if (error) return json({ error: error.message }, 500);
 
         // Host stakes immediately
-        const newBal = p.wallet_balance - stake;
+        const newBal = p.wallet_balance - totalStake;
         await supabase
           .from("players")
           .update({ wallet_balance: newBal })
           .eq("id", player_id);
-        await recordTx(player_id, room.id, "stake", -stake, newBal);
+        await recordTx(player_id, room.id, "stake", -totalStake, newBal);
         await supabase
           .from("rooms")
-          .update({ derash: stake })
+          .update({ derash: totalStake })
           .eq("id", room.id);
         await supabase.from("room_players").insert({
           room_id: room.id,
           player_id,
           role: "player",
           stake_paid: true,
-          card: generateCard(),
+          selected_cartelas: cartelas,
+          auto_fill: true,
+          false_claims: 0,
+          card: combineCards(cartelas),
         });
-        await audit(room.id, player_id, "create_room", { code, stake });
+        await audit(room.id, player_id, "create_room", {
+          code,
+          stakePerCard,
+          totalStake,
+          cartelas,
+          isPrivate: Boolean(is_private),
+        });
         const { data: refreshed } = await supabase
           .from("rooms")
           .select("*")
@@ -230,10 +334,12 @@ Deno.serve(async (req) => {
       }
 
       case "join_room": {
-        const { code, player_id } = args;
+        const { code, player_id, selected_cartelas } = args;
         if (!code || !player_id)
           return json({ error: "missing fields" }, 400);
         const safeCode = String(code).toUpperCase().slice(0, 10);
+        const cartelas = normalizeCartelas(selected_cartelas);
+        const joinStake = (room: { stake_amount: number }) => room.stake_amount * cartelas.length;
         const { data: room } = await supabase
           .from("rooms")
           .select("*")
@@ -265,19 +371,24 @@ Deno.serve(async (req) => {
             .eq("id", player_id)
             .maybeSingle();
           if (!p) return json({ error: "Player not found" }, 404);
-          if (p.wallet_balance < room.stake_amount) {
-            // Auto-fall through to watcher mode if they can't afford
+          const totalStake = joinStake(room);
+          if (p.wallet_balance < totalStake) {
             await supabase.from("room_players").insert({
               room_id: room.id,
               player_id,
               role: "watcher",
               stake_paid: false,
+              selected_cartelas: [],
+              auto_fill: true,
+              false_claims: 0,
               card: [],
             });
-            await audit(room.id, player_id, "join_watcher_no_funds", {});
+            await audit(room.id, player_id, "join_watcher_no_funds", {
+              required: totalStake,
+            });
             return json({ room });
           }
-          const newBal = p.wallet_balance - room.stake_amount;
+          const newBal = p.wallet_balance - totalStake;
           await supabase
             .from("players")
             .update({ wallet_balance: newBal })
@@ -286,22 +397,27 @@ Deno.serve(async (req) => {
             player_id,
             room.id,
             "stake",
-            -room.stake_amount,
+            -totalStake,
             newBal,
           );
           await supabase
             .from("rooms")
-            .update({ derash: room.derash + room.stake_amount })
+            .update({ derash: room.derash + totalStake })
             .eq("id", room.id);
           await supabase.from("room_players").insert({
             room_id: room.id,
             player_id,
             role: "player",
             stake_paid: true,
-            card: generateCard(),
+            selected_cartelas: cartelas,
+            auto_fill: true,
+            false_claims: 0,
+            card: combineCards(cartelas),
           });
           await audit(room.id, player_id, "join_player", {
-            stake: room.stake_amount,
+            stakePerCard: room.stake_amount,
+            totalStake,
+            cartelas,
           });
         } else {
           await supabase.from("room_players").insert({
@@ -309,6 +425,9 @@ Deno.serve(async (req) => {
             player_id,
             role: "watcher",
             stake_paid: false,
+            selected_cartelas: [],
+            auto_fill: true,
+            false_claims: 0,
             card: [],
           });
           await audit(room.id, player_id, "join_watcher", {});
@@ -422,6 +541,7 @@ Deno.serve(async (req) => {
 
         if (rps) {
           for (const rp of rps) {
+            if (!rp.auto_fill) continue;
             if (rp.card.includes(newNumber) && !rp.marked.includes(newNumber)) {
               const marked = [...rp.marked, newNumber];
               await supabase
@@ -446,7 +566,7 @@ Deno.serve(async (req) => {
         if (!room) return json({ error: "Room not found" }, 404);
         if (room.status !== "live")
           return json({ error: "Game not live" }, 400);
-        if (room.winner_id) return json({ error: "Already won" }, 400);
+        if (room.winner_id || room.pending_winner_id) return json({ error: "Already won" }, 400);
 
         const { data: rp } = await supabase
           .from("room_players")
@@ -457,44 +577,171 @@ Deno.serve(async (req) => {
         if (!rp || rp.role !== "player")
           return json({ error: "Not a player" }, 403);
 
-        const win = detectWinningLine(rp.card, rp.marked);
+        const win = hasAnyWinningLine(rp.card, rp.marked);
         if (!win) {
-          await audit(room_id, player_id, "claim_invalid", {});
-          return json({ error: "No completed line" }, 400);
+          const penalty = Math.max(1, Math.floor(room.stake_amount * 0.2));
+          const { data: claimer } = await supabase
+            .from("players")
+            .select("*")
+            .eq("id", player_id)
+            .maybeSingle();
+          if (claimer) {
+            const penalizedBalance = Math.max(0, claimer.wallet_balance - penalty);
+            await supabase
+              .from("players")
+              .update({ wallet_balance: penalizedBalance })
+              .eq("id", player_id);
+            await recordTx(player_id, room_id, "stake", -penalty, penalizedBalance);
+          }
+          await supabase
+            .from("room_players")
+            .update({ false_claims: (rp.false_claims || 0) + 1 })
+            .eq("id", rp.id);
+          await audit(room_id, player_id, "claim_invalid", { penalty });
+          return json({ error: "No completed line", penalty }, 400);
         }
 
-        // Award derash (full pot - house cut already excluded? We compute payout = derash * (1 - commission))
+        // Pause for host/community verification first.
         const payout = Math.floor(
           (room.derash * (100 - room.house_commission_pct)) / 100,
         );
+        await supabase
+          .from("rooms")
+          .update({
+            status: "paused",
+            pending_winner_id: player_id,
+            pending_winning_line: win.name,
+            pending_payout: payout,
+          })
+          .eq("id", room_id);
+        await audit(room_id, player_id, "claim_pending_verification", {
+          line: win.name,
+          payout,
+        });
+        return json({ ok: true, winner: false, pending: true, payout, line: win.name });
+      }
 
-        const { data: winner } = await supabase
+      case "verify_bingo": {
+        const { room_id, host_player_id, approve } = args;
+        if (!room_id || !host_player_id)
+          return json({ error: "missing fields" }, 400);
+
+        const { data: room } = await supabase
+          .from("rooms")
+          .select("*")
+          .eq("id", room_id)
+          .maybeSingle();
+        if (!room) return json({ error: "Room not found" }, 404);
+        if (room.host_id !== host_player_id) return json({ error: "Only host can verify" }, 403);
+        if (room.status !== "paused" || !room.pending_winner_id) {
+          return json({ error: "No pending bingo to verify" }, 400);
+        }
+
+        if (approve !== false) {
+          const payout = Number(room.pending_payout || 0);
+          const winnerId = room.pending_winner_id;
+          const { data: winner } = await supabase
+            .from("players")
+            .select("*")
+            .eq("id", winnerId)
+            .maybeSingle();
+          if (!winner) return json({ error: "Player vanished" }, 500);
+          const newBal = winner.wallet_balance + payout;
+          await supabase
+            .from("players")
+            .update({ wallet_balance: newBal })
+            .eq("id", winnerId);
+          await recordTx(winnerId, room_id, "payout", payout, newBal);
+
+          await supabase
+            .from("rooms")
+            .update({
+              status: "finished",
+              winner_id: winnerId,
+              winning_line: room.pending_winning_line,
+              pending_winner_id: null,
+              pending_winning_line: null,
+              pending_payout: null,
+              finished_at: new Date().toISOString(),
+            })
+            .eq("id", room_id);
+          await audit(room_id, host_player_id, "claim_verified", { winnerId, payout });
+          return json({ ok: true, approved: true });
+        }
+
+        const penalty = Math.max(1, Math.floor(room.stake_amount * 0.2));
+        const { data: claimer } = await supabase
           .from("players")
           .select("*")
-          .eq("id", player_id)
+          .eq("id", room.pending_winner_id)
           .maybeSingle();
-        if (!winner) return json({ error: "Player vanished" }, 500);
-        const newBal = winner.wallet_balance + payout;
+        if (claimer) {
+          const penalizedBalance = Math.max(0, claimer.wallet_balance - penalty);
+          await supabase
+            .from("players")
+            .update({ wallet_balance: penalizedBalance })
+            .eq("id", claimer.id);
+          await recordTx(claimer.id, room_id, "stake", -penalty, penalizedBalance);
+        }
         await supabase
-          .from("players")
-          .update({ wallet_balance: newBal })
-          .eq("id", player_id);
-        await recordTx(player_id, room_id, "payout", payout, newBal);
+          .from("room_players")
+          .update({ false_claims: 1 })
+          .eq("room_id", room_id)
+          .eq("player_id", room.pending_winner_id);
 
         await supabase
           .from("rooms")
           .update({
-            status: "finished",
-            winner_id: player_id,
-            winning_line: win.name,
-            finished_at: new Date().toISOString(),
+            status: "live",
+            pending_winner_id: null,
+            pending_winning_line: null,
+            pending_payout: null,
           })
           .eq("id", room_id);
-        await audit(room_id, player_id, "claim_valid", {
-          line: win.name,
-          payout,
-        });
-        return json({ ok: true, winner: true, payout, line: win.name });
+        await audit(room_id, host_player_id, "claim_rejected", { penalty });
+        return json({ ok: true, approved: false, penalty });
+      }
+
+      case "set_auto_fill": {
+        const { room_id, player_id, auto_fill } = args;
+        if (!room_id || !player_id)
+          return json({ error: "missing fields" }, 400);
+        await supabase
+          .from("room_players")
+          .update({ auto_fill: Boolean(auto_fill) })
+          .eq("room_id", room_id)
+          .eq("player_id", player_id);
+        await audit(room_id, player_id, "toggle_auto_fill", { auto_fill: Boolean(auto_fill) });
+        return json({ ok: true });
+      }
+
+      case "mark_number": {
+        const { room_id, player_id, number } = args;
+        if (!room_id || !player_id || !number)
+          return json({ error: "missing fields" }, 400);
+        const numeric = Number(number);
+        const { data: room } = await supabase
+          .from("rooms")
+          .select("*")
+          .eq("id", room_id)
+          .maybeSingle();
+        if (!room) return json({ error: "Room not found" }, 404);
+        const called = room.call_sequence.slice(0, room.current_index + 1);
+        if (!called.includes(numeric)) return json({ error: "Number not called yet" }, 400);
+
+        const { data: rp } = await supabase
+          .from("room_players")
+          .select("*")
+          .eq("room_id", room_id)
+          .eq("player_id", player_id)
+          .maybeSingle();
+        if (!rp || rp.role !== "player") return json({ error: "Not a player" }, 403);
+        if (!rp.card.includes(numeric)) return json({ error: "Number not on your card" }, 400);
+        if (rp.marked.includes(numeric)) return json({ ok: true, already: true });
+
+        const marked = [...rp.marked, numeric];
+        await supabase.from("room_players").update({ marked }).eq("id", rp.id);
+        return json({ ok: true });
       }
 
       default:

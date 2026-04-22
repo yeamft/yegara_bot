@@ -9,6 +9,8 @@ interface BingoCardProps {
   current: number | null;
   winningLine?: string | null;
   disabled?: boolean;
+  called?: number[];
+  onSelectNumber?: (n: number) => void;
 }
 
 const HEADERS = ["B", "I", "N", "G", "O"];
@@ -20,9 +22,10 @@ const headerColors = [
   "bg-[hsl(265_90%_60%)]",
 ];
 
-export function BingoCard({ numbers, marked, current, disabled }: BingoCardProps) {
+export function BingoCard({ numbers, marked, current, disabled, called = [], onSelectNumber }: BingoCardProps) {
   const { t } = useLang();
   const markedSet = new Set(marked);
+  const calledSet = new Set(called);
 
   if (!numbers.length) {
     return (
@@ -52,20 +55,30 @@ export function BingoCard({ numbers, marked, current, disabled }: BingoCardProps
           const isFree = idx === 12;
           const isMarked = markedSet.has(n) || isFree;
           const isCurrent = !isFree && n === current;
+          const canSelect =
+            !disabled &&
+            !isFree &&
+            !isMarked &&
+            calledSet.has(n) &&
+            typeof onSelectNumber === "function";
           return (
-            <div
+            <button
               key={idx}
+              type="button"
+              onClick={() => canSelect && onSelectNumber?.(n)}
+              disabled={!canSelect}
               className={cn(
                 "aspect-square rounded-lg flex items-center justify-center font-bold text-base border-2 transition-bounce",
                 isFree && "gradient-win text-accent-foreground border-transparent text-xs uppercase",
                 !isFree && isMarked && "gradient-primary text-primary-foreground border-transparent shadow-elegant scale-95",
                 !isFree && !isMarked && isCurrent && "bg-warning/20 text-warning border-warning animate-pulse",
                 !isFree && !isMarked && !isCurrent && "bg-secondary text-foreground border-border",
+                canSelect && "ring-2 ring-accent/60",
                 disabled && "opacity-80",
               )}
             >
               {isFree ? t("free") : n}
-            </div>
+            </button>
           );
         })}
       </div>

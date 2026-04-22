@@ -5,6 +5,7 @@ import { useRoomState } from "@/hooks/useRoomState";
 import { api } from "@/lib/api";
 import { useLang } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { BingoBall } from "@/components/bingo/BingoBall";
 import { BingoCard } from "@/components/bingo/BingoCard";
 import { MasterBoard } from "@/components/bingo/MasterBoard";
@@ -22,8 +23,11 @@ import {
   RefreshCw,
   Languages,
   Coins,
+  Radio,
+  Lock,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { splitCards } from "@/lib/cartela";
 
 export default function Room() {
   const { code } = useParams<{ code: string }>();
@@ -76,6 +80,7 @@ export default function Room() {
       myPlayerId={player!.id}
       myWallet={player!.wallet_balance}
       onLeave={() => navigate("/")}
+      onJoinNextRound={() => navigate("/game")}
     />
   );
 }
@@ -87,6 +92,7 @@ function RoomInner({
   myPlayerId,
   myWallet,
   onLeave,
+  onJoinNextRound,
 }: {
   room: NonNullable<ReturnType<typeof useRoomState>["room"]>;
   players: ReturnType<typeof useRoomState>["players"];
@@ -94,9 +100,13 @@ function RoomInner({
   myPlayerId: string;
   myWallet: number;
   onLeave: () => void;
+  onJoinNextRound: () => void;
 }) {
   const { t, lang, toggle } = useLang();
   const isHost = room.host_id === myPlayerId;
+  const [activeCardIndex, setActiveCardIndex] = useState(0);
+  const [localAutoFill, setLocalAutoFill] = useState<boolean>(Boolean(me?.auto_fill ?? true));
+  const [verifying, setVerifying] = useState(false);
   const called = useMemo(
     () => room.call_sequence.slice(0, room.current_index + 1),
     [room.call_sequence, room.current_index],
@@ -107,6 +117,25 @@ function RoomInner({
   const playerCount = players.filter((p) => p.role === "player").length;
   const watcherCount = players.filter((p) => p.role === "watcher").length;
   const isWatcher = me?.role === "watcher";
+  const myCards = useMemo(() => splitCards(me?.card ?? []), [me?.card]);
+  const activeCard = myCards[activeCardIndex] ?? myCards[0] ?? [];
+  const totalMarkable = myCards.length > 0 ? myCards.length * 24 : 0;
+  const winnerRoomPlayer = players.find((p) => p.player_id === room.winner_id) ?? null;
+  const winnerCards = winnerRoomPlayer ? splitCards(winnerRoomPlayer.card) : [];
+  const winningCardIndexMatch = room.winning_line?.match(/Card\s+(\d+)/i)?.[1];
+  const winningCardIndex = winningCardIndexMatch ? Math.max(0, Number(winningCardIndexMatch) - 1) : 0;
+  const winnerCard = winnerCards[winningCardIndex] ?? winnerCards[0] ?? [];
+
+  useEffect(() => {
+    setLocalAutoFill(Boolean(me?.auto_fill ?? true));
+  }, [me?.auto_fill]);
+
+  useEffect(() => {
+    if (!myCards.length) return;
+    if (activeCardIndex > myCards.length - 1) {
+      setActiveCardIndex(0);
+    }
+  }, [myCards.length, activeCardIndex]);
 
   // Lobby countdown
   const [secondsLeft, setSecondsLeft] = useState<number>(0);
@@ -155,18 +184,28 @@ function RoomInner({
 
   // Pop animation key + haptic on each new ball
   const [popKey, setPopKey] = useState(0);
+  const lastAudioNumberRef = useRef<number | null>(null);
   useEffect(() => {
     if (current) {
       setPopKey((k) => k + 1);
       haptic("light");
+
+      if (lang === "am" && lastAudioNumberRef.current !== current && "speechSynthesis" in window) {
+        const utterance = new SpeechSynthesisUtterance(`ቁጥር ${current}`);
+        utterance.lang = "am-ET";
+        utterance.rate = 0.95;
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(utterance);
+        lastAudioNumberRef.current = current;
+      }
     }
-  }, [current]);
+  }, [current, lang]);
 
   // Auto-detect a complete line on my card and auto-claim once
   const autoClaimedRef = useRef(false);
   useEffect(() => {
     if (autoClaimedRef.current) return;
-    if (!me || isWatcher || room.status !== "live" || room.winner_id) return;
+    if (!me || isWatcher || room.status !== "live" || room.winner_id || !localAutoFill) return;
     if (hasCompletedLine(me.card, me.marked)) {
       autoClaimedRef.current = true;
       api
@@ -181,7 +220,7 @@ function RoomInner({
           autoClaimedRef.current = false;
         });
     }
-  }, [me?.marked, room.status, room.winner_id]);
+  }, [me?.marked, room.status, room.winner_id, localAutoFill]);
 
   // Winner haptic (when someone else won)
   useEffect(() => {
@@ -211,8 +250,24 @@ function RoomInner({
       }
     } catch (e: any) {
       toast.error(e.message);
+      if (String(e.message).includes("No completed line")) {
+        toast.warning(t("falseClaimPenalty"));
+      }
       haptic("error");
     }
+  }
+
+  async function handleAutoFillToggle(checked: boolean) {
+    setLocalAutoFill(checked);
+    await api.setAutoFill(room.id, myPlayerId, checked).catch(() => {
+      setLocalAutoFill((prev) => !prev);
+    });
+  }
+
+  async function handleMarkNumber(n: number) {
+    await api.markNumber(room.id, myPlayerId, n).catch((e: any) => {
+      toast.error(e.message);
+    });
   }
 
   return (
@@ -222,22 +277,31 @@ function RoomInner({
       {/* Dashboard header */}
       <header className="glass rounded-2xl p-3 mt-2 mb-3 shadow-card">
         <div className="flex items-center justify-between mb-2">
-          <button
-            onClick={copyInvite}
-            className="flex items-center gap-1 text-[11px] font-mono font-bold tracking-[0.25em] bg-secondary px-2 py-1 rounded-md"
-          >
-            {room.code} <Copy className="h-3 w-3" />
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={copyInvite}
+              className="flex items-center gap-1 text-[11px] font-mono font-bold tracking-[0.25em] bg-secondary px-2 py-1 rounded-md"
+            >
+              {room.code} <Copy className="h-3 w-3" />
+            </button>
+            {room.is_private && (
+              <span className="text-[10px] bg-secondary px-2 py-1 rounded-md font-bold flex items-center gap-1">
+                <Lock className="h-3 w-3" /> {t("privateRoom")}
+              </span>
+            )}
+          </div>
           <span
             className={cn(
               "text-[10px] font-black uppercase px-2 py-1 rounded-full tracking-wider",
               room.status === "lobby" && "bg-warning/20 text-warning",
               room.status === "live" && "bg-success/20 text-success animate-pulse",
+              room.status === "paused" && "bg-accent/20 text-accent",
               room.status === "finished" && "bg-primary/20 text-primary",
             )}
           >
             {room.status === "lobby" && t("lobbyPhase")}
             {room.status === "live" && t("livePhase")}
+            {room.status === "paused" && t("pausedPhase")}
             {room.status === "finished" && t("finished")}
           </span>
           <button
@@ -247,6 +311,11 @@ function RoomInner({
             <Languages className="h-3 w-3" /> {lang === "en" ? "EN" : "አማ"}
           </button>
         </div>
+        {room.game_id && (
+          <p className="text-[10px] text-muted-foreground mb-2">
+            {t("gameId")}: <span className="font-mono font-bold text-foreground">{room.game_id}</span>
+          </p>
+        )}
         <div className="grid grid-cols-3 gap-2 text-center">
           <Stat
             icon={<Users className="h-3 w-3" />}
@@ -270,17 +339,65 @@ function RoomInner({
       {/* Status overlay */}
       {room.status === "lobby" && (
         <div className="glass rounded-2xl p-4 mb-3 text-center shadow-card">
-          <p className="text-[10px] uppercase tracking-widest text-muted-foreground">
+          <p className="text-[10px] uppercase tracking-widest text-muted-foreground mb-2">
             {t("startsIn")}
           </p>
-          <p className="text-5xl font-black gradient-primary bg-clip-text text-transparent tabular-nums">
-            {secondsLeft}s
+          <p className="text-5xl font-black tabular-nums">
+            <span className="inline-block gradient-primary text-primary-foreground px-5 py-1 rounded-xl shadow-elegant">
+              {secondsLeft}s
+            </span>
           </p>
           <p className="text-xs text-muted-foreground mt-1">
             {t("stake")}: <span className="font-bold text-foreground">{room.stake_amount}</span>
             {" · "}
             {t("derash")}: <span className="font-bold text-warning">{room.derash}</span>
           </p>
+        </div>
+      )}
+
+      {room.status === "paused" && (
+        <div className="glass rounded-2xl p-4 mb-3 text-center shadow-card">
+          <p className="text-sm font-bold mb-1">{t("bingoUnderReview")}</p>
+          <p className="text-xs text-muted-foreground">
+            {winnerRoomPlayer?.player?.username ?? "Player"} · {room.pending_winning_line}
+          </p>
+          {isHost && (
+            <div className="grid grid-cols-2 gap-2 mt-3">
+              <Button
+                disabled={verifying}
+                onClick={async () => {
+                  setVerifying(true);
+                  try {
+                    await api.verifyBingo(room.id, myPlayerId, true);
+                    toast.success(t("approve"));
+                  } catch (e: any) {
+                    toast.error(e.message);
+                  } finally {
+                    setVerifying(false);
+                  }
+                }}
+              >
+                {t("approve")}
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={verifying}
+                onClick={async () => {
+                  setVerifying(true);
+                  try {
+                    await api.verifyBingo(room.id, myPlayerId, false);
+                    toast.warning(t("falseClaimPenalty"));
+                  } catch (e: any) {
+                    toast.error(e.message);
+                  } finally {
+                    setVerifying(false);
+                  }
+                }}
+              >
+                {t("reject")}
+              </Button>
+            </div>
+          )}
         </div>
       )}
 
@@ -319,15 +436,43 @@ function RoomInner({
             <span>{t("yourCard")}</span>
             {!isWatcher && me.card.length > 0 && (
               <span className="text-accent font-bold">
-                {me.marked.filter((n) => n !== 0).length} / 24
+                {me.marked.filter((n) => n !== 0).length} / {totalMarkable}
               </span>
             )}
           </h2>
+          {!isWatcher && (
+            <div className="flex items-center justify-between mb-2 rounded-lg bg-secondary/50 px-2.5 py-1.5">
+              <div className="text-xs font-semibold flex items-center gap-1.5">
+                <Radio className="h-3.5 w-3.5" /> {t("autoFill")}
+              </div>
+              <Switch checked={localAutoFill} onCheckedChange={handleAutoFillToggle} />
+            </div>
+          )}
+          {myCards.length > 1 && (
+            <div className="flex gap-1.5 mb-2 overflow-x-auto pb-1">
+              {myCards.map((_, idx) => (
+                <button
+                  key={idx}
+                  onClick={() => setActiveCardIndex(idx)}
+                  className={cn(
+                    "px-2.5 py-1 rounded-full text-[10px] font-bold border shrink-0",
+                    activeCardIndex === idx
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-secondary border-border",
+                  )}
+                >
+                  Card {idx + 1}
+                </button>
+              ))}
+            </div>
+          )}
           <BingoCard
-            numbers={me.card}
+            numbers={activeCard}
             marked={me.marked}
             current={current}
-            disabled={room.status !== "live"}
+            called={called}
+            onSelectNumber={handleMarkNumber}
+            disabled={room.status !== "live" || isWatcher || localAutoFill}
           />
         </section>
       )}
@@ -367,12 +512,21 @@ function RoomInner({
               </p>
             )}
           </div>
+          {winnerCard.length > 0 && (
+            <div className="w-full">
+              <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">{t("winningCard")}</p>
+              <BingoCard numbers={winnerCard} marked={winnerRoomPlayer?.marked ?? []} current={null} disabled />
+            </div>
+          )}
           <div className="glass rounded-xl p-3 w-full">
             <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
               {called.length} numbers called
             </p>
             <CallLog called={called} limit={10} />
           </div>
+          <Button onClick={onJoinNextRound} className="w-full h-11 font-bold">
+            {t("joinNextRound")}
+          </Button>
         </section>
       )}
 
