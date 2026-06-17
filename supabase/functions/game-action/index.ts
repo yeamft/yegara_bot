@@ -2,6 +2,13 @@
 // All mutations go through this edge function. Clients never write game state directly.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 
+declare const Deno: {
+  env: {
+    get(key: string): string | undefined;
+  };
+  serve(handler: (req: Request) => Response | Promise<Response>): void;
+};
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
@@ -329,6 +336,8 @@ async function joinExistingPublicRoom(
     code: string;
     stake_amount: number;
     derash: number;
+    status: string;
+    lobby_ends_at: string | null;
     max_players?: number | null;
   },
   player_id: string,
@@ -408,7 +417,7 @@ async function requireAdmin(player_id: string) {
   return player;
 }
 
-Deno.serve(async (req) => {
+Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS")
     return new Response("ok", { headers: corsHeaders });
 
@@ -680,6 +689,11 @@ Deno.serve(async (req) => {
             cartelas,
           });
         } else {
+          // Lobby closed: disallow buying cards. If the caller attempted to join as a player (requested cartelas),
+          // reject with an error instead of silently creating a watcher entry.
+          if (Array.isArray(cartelas) && cartelas.length > 0) {
+            return json({ error: "Game already started" }, 400);
+          }
           await supabase.from("room_players").insert({
             room_id: room.id,
             player_id,
@@ -740,7 +754,7 @@ Deno.serve(async (req) => {
           .eq("role", "player");
 
         if (!count || count < 1) {
-          // No one to play; finish the room
+          // No paid players joined before the countdown ended; finish the room.
           await supabase
             .from("rooms")
             .update({
@@ -1290,6 +1304,20 @@ Deno.serve(async (req) => {
           .eq("id", room_id);
         await audit(room_id, admin.id, "admin_close_room", { code: room.code, previous_status: room.status });
         return json({ ok: true });
+      }
+
+      case "admin_clear_room_players": {
+        // Destructive admin action: delete all room_players rows.
+        const { player_id } = args;
+        if (!player_id) return json({ error: "missing player_id" }, 400);
+        const admin = await requireAdmin(String(player_id));
+
+        await supabase
+          .from("room_players")
+          .delete();
+
+        await audit(null, admin.id, "admin_clear_room_players", {});
+        return json({ ok: true, cleared: true });
       }
 
       default:

@@ -34,6 +34,7 @@ type LobbyRoomCard = {
   prizePool: number;
   statusLabel: string;
   countdownSeconds: number | null;
+  joinableAsPlayer: boolean;
 };
 
 const Index = () => {
@@ -44,6 +45,7 @@ const Index = () => {
   const [step, setStep] = useState<LobbyStep>("entry");
   const [selectedStake, setSelectedStake] = useState<number>(20);
   const [selectedRoomCode, setSelectedRoomCode] = useState<string | null>(null);
+  const [selectedRoomStatus, setSelectedRoomStatus] = useState<string | null>(null);
   const [selectedCartelas, setSelectedCartelas] = useState<number[]>([1]);
   const [previewCartela, setPreviewCartela] = useState<number | null>(null);
   const [entryCode, setEntryCode] = useState("");
@@ -64,7 +66,7 @@ const Index = () => {
   );
 
   useEffect(() => {
-    const id = window.setInterval(() => setTick(Date.now()), 1000);
+    const id = window.setInterval(() => setTick(Date.now()), 500);
     return () => window.clearInterval(id);
   }, []);
 
@@ -115,9 +117,56 @@ const Index = () => {
        }
 
        if (!cancelled) {
-         // Only show rooms with at least 1 player in lobby
-         const activeRooms = rooms.filter((room) => (counts[room.id] ?? 0) > 0);
-         setLobbyRooms(activeRooms);
+         // If any lobby expired (showing "Now"), trigger backend transition once.
+         const expired = rooms.filter(
+           (r) => r.status === "lobby" && r.lobby_ends_at && new Date(r.lobby_ends_at).getTime() <= Date.now(),
+         );
+         if (expired.length) {
+           for (const er of expired) {
+             try {
+               await api.tickLobby(er.id);
+             } catch (e) {
+               // ignore; we'll re-query below
+             }
+           }
+           // Re-query rooms to pick up status changes immediately
+           const { data: roomsData2, error: roomsError2 } = await (supabase as any)
+             .from("rooms")
+             .select("*")
+             .eq("status", "lobby")
+             .order("stake_amount", { ascending: true })
+             .order("created_at", { ascending: true });
+
+           if (!roomsError2 && Array.isArray(roomsData2)) {
+             // narrow to allowed stakes
+             const refreshed = (roomsData2 as Room[]).filter((room) =>
+               STAKE_OPTIONS.includes(room.stake_amount as (typeof STAKE_OPTIONS)[number]),
+             );
+             // recompute counts for refreshed rooms
+             const refreshedIds = refreshed.map((r) => r.id);
+             let refreshedCounts: Record<string, number> = {};
+             if (refreshedIds.length > 0) {
+               const { data: rpData, error: rpError } = await (supabase as any)
+                 .from("room_players")
+                 .select("room_id, role")
+                 .in("room_id", refreshedIds);
+               if (!rpError) {
+                 refreshedCounts = (rpData ?? []).reduce((acc: Record<string, number>, row: { room_id: string; role: string }) => {
+                   if (row.role === "player") acc[row.room_id] = (acc[row.room_id] ?? 0) + 1;
+                   return acc;
+                 }, {});
+               }
+             }
+             const activeRooms = refreshed.filter((room) => (refreshedCounts[room.id] ?? 0) > 0);
+             setLobbyRooms(activeRooms);
+             setPlayerCounts(refreshedCounts);
+             setLobbyReady(true);
+             return;
+           }
+         }
+
+          // Keep empty lobby rooms visible so the first player can still join them.
+          setLobbyRooms(rooms);
          setPlayerCounts(counts);
          setLobbyReady(true);
        }
@@ -126,7 +175,7 @@ const Index = () => {
     loadLobbyRooms();
     const pollId = window.setInterval(() => {
       loadLobbyRooms();
-    }, 2000);
+    }, 1000);
 
     return () => {
       cancelled = true;
@@ -137,7 +186,7 @@ const Index = () => {
   const lobbyCards = useMemo<LobbyRoomCard[]>(() => {
     return STAKE_OPTIONS.map((stake) => {
       const roomsForStake = lobbyRooms.filter((room) => room.stake_amount === stake);
-      const openLobbyRooms = roomsForStake.filter((room) => room.status === "lobby" && (playerCounts[room.id] ?? 0) > 0);
+      const openLobbyRooms = roomsForStake.filter((room) => room.status === "lobby");
       const availableRoom = openLobbyRooms.find((room) => {
         const maxPlayers = room.max_players ?? DEFAULT_MAX_PLAYERS;
         return (playerCounts[room.id] ?? 0) < maxPlayers;
@@ -151,14 +200,21 @@ const Index = () => {
       const prizePool = Math.max(0, Math.floor((collectedAmount * (100 - houseCommission)) / 100));
       const countdownSeconds =
         room?.status === "lobby" && room.lobby_ends_at
-          ? Math.max(0, Math.ceil((new Date(room.lobby_ends_at).getTime() - tick) / 1000))
+          ? Math.max(0, Math.floor((new Date(room.lobby_ends_at).getTime() - tick) / 1000))
           : null;
+      const joinableAsPlayer =
+        !!room &&
+        room.status === "lobby" &&
+        !!room.lobby_ends_at &&
+        new Date(room.lobby_ends_at).getTime() > tick &&
+        playersJoined < maxPlayers;
 
       let statusLabel = "Waiting for players";
       if (room?.status === "live") statusLabel = "Live";
       else if (room?.status === "paused") statusLabel = "Bingo under review";
       else if (room?.status === "lobby") {
-        if (countdownSeconds === 0) statusLabel = "Now";
+        if (playersJoined === 0) statusLabel = "Waiting for players";
+        else if (!joinableAsPlayer) statusLabel = "Starting";
         else if (countdownSeconds && countdownSeconds <= 5) statusLabel = `${countdownSeconds}s`;
         else statusLabel = "Lobby open";
       }
@@ -172,6 +228,7 @@ const Index = () => {
         prizePool,
         statusLabel,
         countdownSeconds,
+        joinableAsPlayer,
       };
     });
   }, [lobbyRooms, playerCounts, tick]);
@@ -185,8 +242,19 @@ const Index = () => {
   }
 
   function handleSelectGame(card: LobbyRoomCard) {
+    if (card.room && !card.joinableAsPlayer) {
+      setSelectedStake(card.stake);
+      setSelectedRoomCode(card.room.code);
+      setSelectedRoomStatus(card.room.status ?? "live");
+      setCreatingPrivateRoom(false);
+      setStep("market");
+      haptic("warning");
+      return;
+    }
+
     setSelectedStake(card.stake);
     setSelectedRoomCode(card.room?.code ?? null);
+    setSelectedRoomStatus("lobby");
     setCreatingPrivateRoom(false);
     setStep("market");
     haptic("medium");
@@ -211,6 +279,7 @@ const Index = () => {
 
       setSelectedStake(Number(data.stake_amount ?? 20));
       setSelectedRoomCode(normalizedCode);
+      setSelectedRoomStatus(data.status ?? null);
       setCreatingPrivateRoom(false);
       setStep("market");
     } catch (error: unknown) {
@@ -228,6 +297,7 @@ const Index = () => {
     setStep("market");
     haptic("medium");
   }
+  
 
   useEffect(() => {
     let cancelled = false;
@@ -291,6 +361,16 @@ const Index = () => {
       window.clearInterval(pollId);
     };
   }, [step, selectedRoomCode, lobbyRooms, player?.id]);
+
+  // Keep selectedRoomStatus in sync with latest lobbyRooms data
+  useEffect(() => {
+    if (!selectedRoomCode) {
+      setSelectedRoomStatus(null);
+      return;
+    }
+    const r = lobbyRooms.find((x) => x.code === selectedRoomCode);
+    setSelectedRoomStatus(r?.status ?? null);
+  }, [selectedRoomCode, lobbyRooms]);
 
   async function handleJoinSelectedGame() {
     if (!player) return;
@@ -523,10 +603,17 @@ const Index = () => {
                     </div>
                     <div className="min-w-0 flex items-center justify-center gap-1 text-muted-foreground text-center">
                       <Clock3 className="h-3 w-3 shrink-0" />
-                      <span className="truncate">{card.countdownSeconds !== null ? (card.countdownSeconds === 0 ? "Now" : `${card.countdownSeconds}s`) : "—"}</span>
+                      <span className="truncate">{card.joinableAsPlayer && card.countdownSeconds !== null ? `Join ${card.countdownSeconds}s` : card.room ? "Closed" : "Open"}</span>
                     </div>
                     <Button
-                      onClick={() => handleSelectGame(card)}
+                      onClick={() => {
+                        if (card.room && !card.joinableAsPlayer) {
+                          toast.error("Game already started");
+                          return;
+                        }
+                        handleSelectGame(card);
+                      }}
+                      disabled={Boolean(card.room && !card.joinableAsPlayer)}
                       className="h-5 rounded-md gradient-primary text-primary-foreground font-black shadow-elegant text-[8px] px-2 min-w-0"
                     >
                       Join
@@ -605,7 +692,7 @@ const Index = () => {
                           ? "border-border bg-secondary/40 text-muted-foreground opacity-50 cursor-not-allowed"
                           : "border-border bg-secondary text-foreground hover:border-primary/50"
                     }`}
-                    disabled={blocked}
+                    disabled={blocked || (selectedRoomStatus && selectedRoomStatus !== "lobby" && !creatingPrivateRoom)}
                     title={takenByOtherUser ? "Already selected by another player" : undefined}
                   >
                     {n}
@@ -646,9 +733,15 @@ const Index = () => {
             </div>
           )}
 
+          {selectedRoomStatus && selectedRoomStatus !== "lobby" && !creatingPrivateRoom && (
+            <div className="rounded-xl border border-destructive/40 bg-destructive/10 p-2.5 mb-2 text-destructive font-semibold text-center">
+              Game already started — purchasing cards disabled
+            </div>
+          )}
+
           <Button
             onClick={handleJoinSelectedGame}
-            disabled={busy !== null || !selectedCartelas.length || !canAfford}
+            disabled={busy !== null || !selectedCartelas.length || !canAfford || (selectedRoomStatus && selectedRoomStatus !== "lobby" && !creatingPrivateRoom)}
             size="lg"
             className="w-full h-10 rounded-xl gradient-primary text-primary-foreground font-black shadow-elegant text-sm"
           >
