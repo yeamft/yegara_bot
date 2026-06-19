@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: bingo-blitz-telegram-bot
+    runtime: node
+    rootDir: bot
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: TELEGRAM_MINI_APP_URL
+        sync: false

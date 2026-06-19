@@ -1,0 +1,13 @@
+{
+  "name": "bingo-blitz-live-bot",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Telegram polling bot for Bingo Blitz Live",
+  "scripts": {
+    "start": "node telegram-bot.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
