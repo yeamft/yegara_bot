@@ -9,6 +9,7 @@
     "build:dev": "vite build --mode development",
     "lint": "eslint .",
     "preview": "vite preview",
+    "bot": "node bot/telegram-bot.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },

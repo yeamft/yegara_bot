@@ -426,29 +426,40 @@ Deno.serve(async (req: Request) => {
 
     switch (action) {
       case "upsert_player": {
-        const { telegram_id, username } = args;
+        const { telegram_id, username, phone_number } = args;
         if (!telegram_id || !username)
           return json({ error: "missing identity" }, 400);
         const tid = String(telegram_id).slice(0, 64);
         const uname = String(username).slice(0, 32);
+        const phone = typeof phone_number === "string" && phone_number.trim()
+          ? phone_number.trim().slice(0, 32)
+          : null;
         const { data: existing } = await supabase
           .from("players")
           .select("*")
           .eq("telegram_id", tid)
           .maybeSingle();
         if (existing) {
+          const updates: Record<string, string> = {};
           if (existing.username !== uname) {
+            updates.username = uname;
+          }
+          if (phone && (existing as { phone_number?: string | null }).phone_number !== phone) {
+            updates.phone_number = phone;
+          }
+          if (Object.keys(updates).length > 0) {
             await supabase
               .from("players")
-              .update({ username: uname })
+              .update(updates)
               .eq("id", existing.id);
-            existing.username = uname;
+            existing.username = updates.username ?? existing.username;
+            (existing as { phone_number?: string | null }).phone_number = updates.phone_number ?? (existing as { phone_number?: string | null }).phone_number;
           }
           return json({ player: normalizePlayerWallets(existing) });
         }
         const { data, error } = await supabase
           .from("players")
-          .insert({ telegram_id: tid, username: uname })
+          .insert({ telegram_id: tid, username: uname, phone_number: phone })
           .select()
           .single();
         if (error) return json({ error: error.message }, 500);
@@ -459,6 +470,18 @@ Deno.serve(async (req: Request) => {
         });
         await recordTx(data.id, null, "seed", seeded.play_wallet_balance, seeded.play_wallet_balance);
         return json({ player: seeded });
+      }
+
+      case "get_player_by_telegram": {
+        const { telegram_id } = args;
+        if (!telegram_id) return json({ error: "missing telegram_id" }, 400);
+        const tid = String(telegram_id).slice(0, 64);
+        const { data: player } = await supabase
+          .from("players")
+          .select("*")
+          .eq("telegram_id", tid)
+          .maybeSingle();
+        return json({ player: player ? normalizePlayerWallets(player) : null });
       }
 
       case "create_room": {

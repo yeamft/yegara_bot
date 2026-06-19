@@ -103,6 +103,23 @@ async function registerPlayer(messageOrUser) {
   return player;
 }
 
+async function registerPlayerWithPhone(messageOrUser, phoneNumber) {
+  const identity = getTelegramIdentity(messageOrUser);
+  const { player } = await callGameAction("upsert_player", {
+    ...identity,
+    phone_number: phoneNumber,
+  });
+  return player;
+}
+
+async function findPlayerByTelegram(messageOrUser) {
+  const identity = getTelegramIdentity(messageOrUser);
+  const { player } = await callGameAction("get_player_by_telegram", {
+    telegram_id: identity.telegram_id,
+  });
+  return player;
+}
+
 async function getWalletSummary(player_id) {
   return callGameAction("get_wallet_summary", { player_id });
 }
@@ -112,6 +129,7 @@ function getSession(chatId) {
     sessionState.set(chatId, {
       lastAction: "Opened bot",
       lastVisitedAt: new Date().toISOString(),
+      awaitingPhoneRegistration: false,
     });
   }
   return sessionState.get(chatId);
@@ -154,6 +172,26 @@ function menuText(player, summary, session) {
     `🏦 Main wallet: ${summary.summary.main_wallet_balance}`,
     `🧮 Total balance: ${summary.summary.total_balance}`,
     `🕒 Last action: ${session.lastAction}`,
+    "",
+    "Choose an option below:",
+    "🎮 Play",
+    "📝 Register",
+    "💵 Deposit",
+    "🏧 Withdrawal",
+    "📘 Instructions",
+    "🆘 Contact Support",
+    "📨 Invite",
+  ].join("\n");
+}
+
+function guestMenuText(identity, session) {
+  return [
+    `👋 Welcome ${identity.username}!`,
+    "Welcome to Yegara Bingo.",
+    "",
+    "Registration status: Not registered",
+    `🕒 Last action: ${session.lastAction}`,
+    session.awaitingPhoneRegistration ? "📱 Waiting for your phone number" : "Tap Register to create your account",
     "",
     "Choose an option below:",
     "🎮 Play",
@@ -217,10 +255,13 @@ function balanceText(summary) {
   ].join("\n");
 }
 
-async function sendStart(chatId, player) {
-  const summary = await getWalletSummary(player.id);
+async function sendStart(chatId, messageOrUser) {
+  const identity = getTelegramIdentity(messageOrUser);
+  const player = await findPlayerByTelegram(messageOrUser);
   const session = updateSession(chatId, { lastAction: "Opened main menu" });
-  const caption = `${menuText(player, summary, session)}\n\n${helpText()}`;
+  const caption = player
+    ? `${menuText(player, await getWalletSummary(player.id), session)}\n\n${helpText()}`
+    : `${guestMenuText(identity, session)}\n\n${helpText()}`;
 
   if (LOGO_URL) {
     await telegram("sendPhoto", {
@@ -239,30 +280,89 @@ async function sendStart(chatId, player) {
   });
 }
 
+async function sendRegistrationPrompt(chatId) {
+  updateSession(chatId, {
+    lastAction: "Waiting for phone number",
+    awaitingPhoneRegistration: true,
+  });
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text: "📱 To register, tap the button below and share your phone number.",
+    reply_markup: {
+      keyboard: [[{ text: "📱 Share phone number", request_contact: true }]],
+      resize_keyboard: true,
+      one_time_keyboard: true,
+    },
+  });
+}
+
+async function requireRegisteredPlayer(messageOrUser) {
+  const player = await findPlayerByTelegram(messageOrUser);
+  if (!player) {
+    throw new Error("Please register first using the Register button and share your phone number.");
+  }
+  return player;
+}
+
+async function handlePhoneRegistration(message) {
+  const chatId = message.chat.id;
+  const session = getSession(chatId);
+  const contact = message.contact;
+  if (!session.awaitingPhoneRegistration) return false;
+  if (!contact?.phone_number) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: "Please use the phone share button so I can complete your registration.",
+    });
+    return true;
+  }
+  if (contact.user_id && message.from?.id && contact.user_id !== message.from.id) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: "Please share your own phone number.",
+    });
+    return true;
+  }
+
+  const player = await registerPlayerWithPhone(message, contact.phone_number);
+  updateSession(chatId, {
+    lastAction: "Registered account",
+    awaitingPhoneRegistration: false,
+    phoneNumber: contact.phone_number,
+  });
+
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text: `✅ Registered as ${player.username}\n📱 Phone: ${contact.phone_number}`,
+    reply_markup: { remove_keyboard: true },
+  });
+  await sendStart(chatId, message);
+  return true;
+}
+
 async function handleCommand(message) {
   const chatId = message.chat.id;
   const text = (message.text || "").trim();
   const [command, ...rest] = text.split(/\s+/);
 
   try {
+    if (message.contact) {
+      const handled = await handlePhoneRegistration(message);
+      if (handled) return;
+    }
+
     if (command === "/start") {
-      const player = await registerPlayer(message);
-      await sendStart(chatId, player);
+      await sendStart(chatId, message);
       return;
     }
 
     if (command === "/register") {
-      const player = await registerPlayer(message);
-      updateSession(chatId, { lastAction: "Registered account" });
-      await telegram("sendMessage", {
-        chat_id: chatId,
-        text: `✅ Registered as ${player.username}\nTelegram ID: ${player.telegram_id}`,
-      });
+      await sendRegistrationPrompt(chatId);
       return;
     }
 
     if (command === "/balance") {
-      const player = await registerPlayer(message);
+      const player = await requireRegisteredPlayer(message);
       const summary = await callGameAction("get_wallet_summary", { player_id: player.id });
       updateSession(chatId, { lastAction: "Checked balance" });
       await telegram("sendMessage", { chat_id: chatId, text: balanceText(summary) });
@@ -279,7 +379,7 @@ async function handleCommand(message) {
         });
         return;
       }
-      const player = await registerPlayer(message);
+      const player = await requireRegisteredPlayer(message);
       const result = await callGameAction("request_deposit", {
         player_id: player.id,
         amount,
@@ -303,7 +403,7 @@ async function handleCommand(message) {
         });
         return;
       }
-      const player = await registerPlayer(message);
+      const player = await requireRegisteredPlayer(message);
       const result = await callGameAction("request_withdrawal", {
         player_id: player.id,
         amount,
@@ -369,18 +469,12 @@ async function handleCallbackQuery(callbackQuery) {
 
   try {
     if (callbackQuery.data === "balance") {
-      const player = await registerPlayer(callbackQuery.from);
+      const player = await requireRegisteredPlayer(callbackQuery.from);
       const summary = await callGameAction("get_wallet_summary", { player_id: player.id });
       updateSession(chatId, { lastAction: "Checked balance" });
       await telegram("sendMessage", { chat_id: chatId, text: balanceText(summary) });
     } else if (callbackQuery.data === "register") {
-      const player = await registerPlayer(callbackQuery.from);
-      updateSession(chatId, { lastAction: "Registered account" });
-      await telegram("sendMessage", {
-        chat_id: chatId,
-        text: `✅ Registered as ${player.username}\nTelegram ID: ${player.telegram_id}`,
-        reply_markup: mainMenuMarkup(),
-      });
+      await sendRegistrationPrompt(chatId);
     } else if (callbackQuery.data === "play") {
       updateSession(chatId, { lastAction: "Opened play link" });
       if (!MINI_APP_URL) {
@@ -436,7 +530,7 @@ async function poll() {
 
       for (const update of data.result) {
         offset = update.update_id + 1;
-        if (update.message?.text) await handleCommand(update.message);
+        if (update.message?.text || update.message?.contact) await handleCommand(update.message);
         if (update.callback_query) await handleCallbackQuery(update.callback_query);
       }
     } catch (error) {
