@@ -38,7 +38,6 @@ const SUPABASE_URL = process.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 const MINI_APP_URL = process.env.TELEGRAM_MINI_APP_URL || process.env.APP_URL || "";
 const SUPPORT_CONTACT = process.env.TELEGRAM_SUPPORT_CONTACT || process.env.SUPPORT_CONTACT || "@yegarabingo_support";
-const INVITE_URL = process.env.TELEGRAM_INVITE_URL || MINI_APP_URL || "";
 const LOGO_URL = process.env.TELEGRAM_BOT_LOGO_URL || process.env.YEGARA_BINGO_LOGO_URL || "";
 const PORT = Number(process.env.PORT || 3000);
 const sessionState = new Map();
@@ -166,7 +165,6 @@ function helpText() {
     "/withdraw <amount> <note> - Create a withdrawal request",
     "/play - Open the Bingo app",
     "/support - Contact support",
-    "/invite - Share the game link",
   ].join("\n");
 }
 
@@ -188,7 +186,6 @@ function menuText(player, summary, session) {
     "🏧 Withdrawal",
     "📘 Instructions",
     "🆘 Contact Support",
-    "📨 Invite",
   ].join("\n");
 }
 
@@ -208,7 +205,6 @@ function guestMenuText(identity, session) {
     "🏧 Withdrawal",
     "📘 Instructions",
     "🆘 Contact Support",
-    "📨 Invite",
   ].join("\n");
 }
 
@@ -232,19 +228,11 @@ function supportText() {
   ].join("\n");
 }
 
-function inviteText() {
-  return [
-    "📨 Invite your friends to Yegara Bingo!",
-    INVITE_URL ? `Open game: ${INVITE_URL}` : "Invite link is not configured yet.",
-  ].join("\n");
-}
-
 function mainMenuMarkup() {
   const rows = [
     [{ text: "🎮 Play", callback_data: "play" }, { text: "📝 Register", callback_data: "register" }],
     [{ text: "💵 Deposit", callback_data: "deposit_help" }, { text: "🏧 Withdrawal", callback_data: "withdraw_help" }],
     [{ text: "📘 Instructions", callback_data: "instructions" }, { text: "🆘 Support", callback_data: "support" }],
-    [{ text: "📨 Invite", callback_data: "invite" }],
   ];
 
   if (MINI_APP_URL) {
@@ -437,12 +425,6 @@ async function handleCommand(message) {
       return;
     }
 
-    if (command === "/invite") {
-      updateSession(chatId, { lastAction: "Opened invite info" });
-      await telegram("sendMessage", { chat_id: chatId, text: inviteText(), reply_markup: mainMenuMarkup() });
-      return;
-    }
-
     if (command === "/play") {
       updateSession(chatId, { lastAction: "Opened play link" });
       if (!MINI_APP_URL) {
@@ -514,9 +496,6 @@ async function handleCallbackQuery(callbackQuery) {
     } else if (callbackQuery.data === "support") {
       updateSession(chatId, { lastAction: "Opened support info" });
       await telegram("sendMessage", { chat_id: chatId, text: supportText(), reply_markup: mainMenuMarkup() });
-    } else if (callbackQuery.data === "invite") {
-      updateSession(chatId, { lastAction: "Opened invite info" });
-      await telegram("sendMessage", { chat_id: chatId, text: inviteText(), reply_markup: mainMenuMarkup() });
     }
   } catch (error) {
     await telegram("sendMessage", {
