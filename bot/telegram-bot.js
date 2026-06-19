@@ -37,6 +37,9 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOK
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 const MINI_APP_URL = process.env.TELEGRAM_MINI_APP_URL || process.env.APP_URL || "";
+const SUPPORT_CONTACT = process.env.TELEGRAM_SUPPORT_CONTACT || process.env.SUPPORT_CONTACT || "@yegarabingo_support";
+const INVITE_URL = process.env.TELEGRAM_INVITE_URL || MINI_APP_URL || "";
+const LOGO_URL = process.env.TELEGRAM_BOT_LOGO_URL || process.env.YEGARA_BINGO_LOGO_URL || "";
 const PORT = Number(process.env.PORT || 3000);
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -105,15 +108,77 @@ function helpText() {
     "",
     "/start - Register and show quick actions",
     "/register - Register your account",
+    "/instructions - How to use Yegara Bingo",
     "/balance - Show wallet balances",
     "/deposit <amount> <note> - Create a deposit request",
+    "/withdraw <amount> <note> - Create a withdrawal request",
     "/play - Open the Bingo app",
+    "/support - Contact support",
+    "/invite - Share the game link",
   ].join("\n");
+}
+
+function menuText(player) {
+  return [
+    `� Welcome ${player.username}!`,
+    "Welcome to Yegara Bingo.",
+    "",
+    "Choose an option below:",
+    "🎮 Play",
+    "📝 Register",
+    "💵 Deposit",
+    "🏧 Withdrawal",
+    "📘 Instructions",
+    "🆘 Contact Support",
+    "📨 Invite",
+  ].join("\n");
+}
+
+function instructionsText() {
+  return [
+    "📘 Yegara Bingo Instructions",
+    "",
+    "1. Tap Play to open the game.",
+    "2. Register automatically with /start or /register.",
+    "3. Deposit to fund your wallet.",
+    "4. Join a room and choose your cartelas.",
+    "5. Claim bingo when your line is complete.",
+  ].join("\n");
+}
+
+function supportText() {
+  return [
+    "🆘 Contact Support",
+    "",
+    `Support: ${SUPPORT_CONTACT}`,
+  ].join("\n");
+}
+
+function inviteText() {
+  return [
+    "📨 Invite your friends to Yegara Bingo!",
+    INVITE_URL ? `Open game: ${INVITE_URL}` : "Invite link is not configured yet.",
+  ].join("\n");
+}
+
+function mainMenuMarkup() {
+  const rows = [
+    [{ text: "🎮 Play", callback_data: "play" }, { text: "📝 Register", callback_data: "register" }],
+    [{ text: "💵 Deposit", callback_data: "deposit_help" }, { text: "🏧 Withdrawal", callback_data: "withdraw_help" }],
+    [{ text: "📘 Instructions", callback_data: "instructions" }, { text: "🆘 Support", callback_data: "support" }],
+    [{ text: "📨 Invite", callback_data: "invite" }],
+  ];
+
+  if (MINI_APP_URL) {
+    rows[0][0] = { text: "🎮 Play", web_app: { url: MINI_APP_URL } };
+  }
+
+  return { inline_keyboard: rows };
 }
 
 function balanceText(summary) {
   return [
-    `👤 ${summary.player.username}`,
+    `� ${summary.player.username}`,
     `💼 Play wallet: ${summary.summary.play_wallet_balance}`,
     `🏦 Main wallet: ${summary.summary.main_wallet_balance}`,
     `🧮 Total: ${summary.summary.total_balance}`,
@@ -121,26 +186,22 @@ function balanceText(summary) {
 }
 
 async function sendStart(chatId, player) {
-  const text = [
-    `👋 Welcome ${player.username}!`,
-    "Your Bingo account is ready.",
-    "",
-    helpText(),
-  ].join("\n");
+  const caption = `${menuText(player)}\n\n${helpText()}`;
 
-  const reply_markup = MINI_APP_URL
-    ? {
-        inline_keyboard: [
-          [{ text: "🎮 Play Bingo", web_app: { url: MINI_APP_URL } }],
-          [{ text: "💰 Check Balance", callback_data: "balance" }],
-        ],
-      }
-    : undefined;
+  if (LOGO_URL) {
+    await telegram("sendPhoto", {
+      chat_id: chatId,
+      photo: LOGO_URL,
+      caption,
+      reply_markup: mainMenuMarkup(),
+    });
+    return;
+  }
 
   await telegram("sendMessage", {
     chat_id: chatId,
-    text,
-    reply_markup,
+    text: caption,
+    reply_markup: mainMenuMarkup(),
   });
 }
 
@@ -195,6 +256,44 @@ async function handleCommand(message) {
       return;
     }
 
+    if (command === "/withdraw" || command === "/withdrawal") {
+      const amount = Number(rest[0]);
+      const note = rest.slice(1).join(" ") || "Telegram withdrawal request";
+      if (!Number.isFinite(amount) || amount <= 0) {
+        await telegram("sendMessage", {
+          chat_id: chatId,
+          text: "Usage: /withdraw <amount> <note>\nExample: /withdraw 100 CBE account",
+        });
+        return;
+      }
+      const player = await registerPlayer(message);
+      const result = await callGameAction("request_withdrawal", {
+        player_id: player.id,
+        amount,
+        note,
+      });
+      await telegram("sendMessage", {
+        chat_id: chatId,
+        text: `🏧 Withdrawal request submitted\nAmount: ${amount}\nStatus: ${result.request.status}`,
+      });
+      return;
+    }
+
+    if (command === "/instructions") {
+      await telegram("sendMessage", { chat_id: chatId, text: instructionsText(), reply_markup: mainMenuMarkup() });
+      return;
+    }
+
+    if (command === "/support") {
+      await telegram("sendMessage", { chat_id: chatId, text: supportText(), reply_markup: mainMenuMarkup() });
+      return;
+    }
+
+    if (command === "/invite") {
+      await telegram("sendMessage", { chat_id: chatId, text: inviteText(), reply_markup: mainMenuMarkup() });
+      return;
+    }
+
     if (command === "/play") {
       if (!MINI_APP_URL) {
         await telegram("sendMessage", {
@@ -231,6 +330,41 @@ async function handleCallbackQuery(callbackQuery) {
       const player = await registerPlayer(callbackQuery.from);
       const summary = await callGameAction("get_wallet_summary", { player_id: player.id });
       await telegram("sendMessage", { chat_id: chatId, text: balanceText(summary) });
+    } else if (callbackQuery.data === "register") {
+      const player = await registerPlayer(callbackQuery.from);
+      await telegram("sendMessage", {
+        chat_id: chatId,
+        text: `✅ Registered as ${player.username}\nTelegram ID: ${player.telegram_id}`,
+        reply_markup: mainMenuMarkup(),
+      });
+    } else if (callbackQuery.data === "play") {
+      if (!MINI_APP_URL) {
+        await telegram("sendMessage", { chat_id: chatId, text: "Mini app URL is not configured yet." });
+      } else {
+        await telegram("sendMessage", {
+          chat_id: chatId,
+          text: "Tap below to play Bingo.",
+          reply_markup: { inline_keyboard: [[{ text: "🎮 Open Bingo", web_app: { url: MINI_APP_URL } }]] },
+        });
+      }
+    } else if (callbackQuery.data === "deposit_help") {
+      await telegram("sendMessage", {
+        chat_id: chatId,
+        text: "💵 To deposit, send: /deposit <amount> <note>\nExample: /deposit 100 CBE transfer",
+        reply_markup: mainMenuMarkup(),
+      });
+    } else if (callbackQuery.data === "withdraw_help") {
+      await telegram("sendMessage", {
+        chat_id: chatId,
+        text: "🏧 To withdraw, send: /withdraw <amount> <note>\nExample: /withdraw 100 Telebirr",
+        reply_markup: mainMenuMarkup(),
+      });
+    } else if (callbackQuery.data === "instructions") {
+      await telegram("sendMessage", { chat_id: chatId, text: instructionsText(), reply_markup: mainMenuMarkup() });
+    } else if (callbackQuery.data === "support") {
+      await telegram("sendMessage", { chat_id: chatId, text: supportText(), reply_markup: mainMenuMarkup() });
+    } else if (callbackQuery.data === "invite") {
+      await telegram("sendMessage", { chat_id: chatId, text: inviteText(), reply_markup: mainMenuMarkup() });
     }
   } catch (error) {
     await telegram("sendMessage", {
